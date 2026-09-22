@@ -9,16 +9,15 @@ from pathlib import Path
 # ==================== কনফিগ ====================
 BOT_TOKEN     = os.environ["BOT_TOKEN"]
 API_TOKEN     = os.environ["UNIXSMS_TOKEN"]
-CHAT_ID       = int(os.environ["CHAT_ID"])   # গ্রুপ ID (নেগেটিভ, যেমন -1001234567890)
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "2"))
+CHAT_ID       = int(os.environ["CHAT_ID"])
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "10"))
 RECORDS       = int(os.getenv("RECORDS_PER_FETCH", "50"))
 API_URL       = "https://agent-api.unixsms.com/v2/cdr"
 
-# Railway Volume mount path — না থাকলে বর্তমান ডিরেক্টরি
-DATA_DIR    = Path(os.getenv("DATA_DIR", "."))
+DATA_DIR   = Path(os.getenv("DATA_DIR", "."))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
-STATE_FILE  = DATA_DIR / "seen_ids.json"
-LOG_FILE    = DATA_DIR / "bot.log"
+STATE_FILE = DATA_DIR / "seen_ids.json"
+LOG_FILE   = DATA_DIR / "bot.log"
 
 # ==================== লগিং ====================
 logging.basicConfig(
@@ -31,7 +30,6 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ==================== বট ====================
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
 # ==================== স্টেট ====================
@@ -40,8 +38,7 @@ def load_seen():
         try:
             with open(STATE_FILE) as f:
                 return set(json.load(f))
-        except Exception as e:
-            log.warning(f"State load failed: {e}")
+        except Exception:
             return set()
     return set()
 
@@ -53,20 +50,43 @@ def save_seen(seen):
     os.replace(tmp, STATE_FILE)
 
 def rec_id(row):
-    return (
-        f"{row.get('dt')}|{row.get('num')}|"
-        f"{row.get('cli')}|{row.get('message')}"
-    )
+    return f"{row.get('dt')}|{row.get('num')}|{row.get('cli')}|{row.get('message')}"
 
-# ==================== API ====================
+# ==================== API (429 handling) ====================
+rate_limited_until = 0    # epoch time — এই সময় পর্যন্ত API কল করব না
+
 def fetch():
-    r = requests.get(
-        API_URL,
-        params={"token": API_TOKEN, "records": RECORDS},
-        timeout=15,
-    )
-    r.raise_for_status()
-    return r.json()
+    global rate_limited_until
+    now = time.time()
+
+    if now < rate_limited_until:
+        wait = int(rate_limited_until - now)
+        log.info(f"API rate-limited — আরও {wait}s অপেক্ষা")
+        return None
+
+    try:
+        r = requests.get(
+            API_URL,
+            params={"token": API_TOKEN, "records": RECORDS},
+            timeout=15,
+        )
+
+        if r.status_code == 429:
+            retry_after = int(r.headers.get("Retry-After", 60))
+            retry_after = max(retry_after, 60)   # অন্তত ৬০ সেকেন্ড থামি
+            rate_limited_until = time.time() + retry_after
+            log.warning(f"429 পাওয়া গেছে — {retry_after}s থামছি")
+            return None
+
+        r.raise_for_status()
+        return r.json()
+
+    except requests.exceptions.HTTPError as e:
+        if e.response is not None and e.response.status_code == 429:
+            rate_limited_until = time.time() + 60
+            log.warning("429 (HTTPError) — 60s থামছি")
+            return None
+        raise
 
 # ==================== মেসেজ ফরম্যাট ====================
 def fmt(row):
@@ -79,7 +99,6 @@ def fmt(row):
         f"💬 {row.get('message')}"
     )
 
-# ==================== গ্রুপে পাঠানো ====================
 def send_to_group(text):
     try:
         bot.send_message(CHAT_ID, text)
@@ -88,27 +107,38 @@ def send_to_group(text):
         log.error(f"Send to group {CHAT_ID} failed: {e}")
         return False
 
-# ==================== মেইন লুপ ====================
+# ==================== গ্রুপ ভেরিফিকেশন ====================
+def verify_group():
+    try:
+        bot.send_message(
+            CHAT_ID,
+            f"✅ <b>Unix SMS Forwarder চালু হয়েছে</b>\n"
+            f"⏱ Poll: {POLL_INTERVAL}s | 📥 Fetch: {RECORDS}\n"
+            f"📢 Group: <code>{CHAT_ID}</code>"
+        )
+        log.info("✅ গ্রুপে startup message পাঠানো সফল")
+        return True
+    except Exception as e:
+        log.error(f"❌ গ্রুপে পাঠানো যাচ্ছে না: {e}")
+        log.error("   → বট গ্রুপে অ্যাড করা আছে?")
+        log.error("   → বট কি Admin?")
+        log.error("   → CHAT_ID সঠিক?")
+        return False
+
+# ==================== মেইন ====================
 def main():
     seen = load_seen()
     first_run = len(seen) == 0
-    log.info(f"Bot চালু হলো | group={CHAT_ID} | poll={POLL_INTERVAL}s | first_run={first_run}")
+    log.info(f"Bot চালু | group={CHAT_ID} | poll={POLL_INTERVAL}s | first_run={first_run}")
 
-    # গ্রুপে startup message
-    send_to_group(
-        f"✅ Unix SMS Forwarder চালু হয়েছে\n"
-        f"⏱ Poll: {POLL_INTERVAL}s | 📥 Fetch: {RECORDS}\n"
-        f"📢 Group ID: <code>{CHAT_ID}</code>"
-    )
-
-    fail_count = 0
+    verify_group()
 
     while True:
         loop_start = time.time()
         try:
             data = fetch()
 
-            if data.get("status") == "success":
+            if data is not None and data.get("status") == "success":
                 new_rows = []
                 for row in data.get("data", []):
                     rid = rec_id(row)
@@ -126,19 +156,12 @@ def main():
                     for row in new_rows:
                         if send_to_group(fmt(row)):
                             sent += 1
-                        time.sleep(0.3)
+                        time.sleep(0.5)
                     save_seen(seen)
                     log.info(f"{sent} টি নতুন SMS গ্রুপে পাঠানো হলো")
 
-                fail_count = 0
-
         except Exception as e:
-            fail_count += 1
-            log.error(f"Poll error #{fail_count}: {e}")
-            if fail_count >= 5:
-                log.warning("Backoff 30s")
-                time.sleep(30)
-                fail_count = 0
+            log.error(f"Poll error: {e}")
 
         elapsed = time.time() - loop_start
         time.sleep(max(0, POLL_INTERVAL - elapsed))
