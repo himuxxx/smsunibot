@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import json
 import logging
@@ -10,8 +11,8 @@ from pathlib import Path
 BOT_TOKEN     = os.environ["BOT_TOKEN"]
 API_TOKEN     = os.environ["UNIXSMS_TOKEN"]
 CHAT_ID       = int(os.environ["CHAT_ID"])
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "20"))    # ২০ সেকেন্ড
-RECORDS       = int(os.getenv("RECORDS_PER_FETCH", "200"))  # max 200
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "20"))
+RECORDS       = int(os.getenv("RECORDS_PER_FETCH", "200"))
 API_URL       = "https://agent-api.unixsms.com/v2/cdr"
 
 DATA_DIR   = Path(os.getenv("DATA_DIR", "."))
@@ -19,6 +20,7 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 STATE_FILE = DATA_DIR / "state.json"
 LOG_FILE   = DATA_DIR / "bot.log"
 
+# ==================== লগিং ====================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -31,6 +33,89 @@ log = logging.getLogger(__name__)
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
+# ==================== Country Map ====================
+COUNTRY_MAP = {
+    "880": ("🇧🇩", "Bangladesh"),
+    "977": ("🇳🇵", "Nepal"),
+    "91":  ("🇮🇳", "India"),
+    "92":  ("🇵🇰", "Pakistan"),
+    "94":  ("🇱🇰", "Sri Lanka"),
+    "95":  ("🇲🇲", "Myanmar"),
+    "60":  ("🇲🇾", "Malaysia"),
+    "62":  ("🇮🇩", "Indonesia"),
+    "63":  ("🇵🇭", "Philippines"),
+    "65":  ("🇸🇬", "Singapore"),
+    "66":  ("🇹🇭", "Thailand"),
+    "84":  ("🇻🇳", "Vietnam"),
+    "86":  ("🇨🇳", "China"),
+    "81":  ("🇯🇵", "Japan"),
+    "82":  ("🇰🇷", "South Korea"),
+    "1":   ("🇺🇸", "USA/Canada"),
+    "7":   ("🇷🇺", "Russia"),
+    "20":  ("🇪🇬", "Egypt"),
+    "27":  ("🇿🇦", "South Africa"),
+    "31":  ("🇳🇱", "Netherlands"),
+    "33":  ("🇫🇷", "France"),
+    "34":  ("🇪🇸", "Spain"),
+    "39":  ("🇮🇹", "Italy"),
+    "44":  ("🇬🇧", "UK"),
+    "49":  ("🇩🇪", "Germany"),
+    "55":  ("🇧🇷", "Brazil"),
+    "90":  ("🇹🇷", "Turkey"),
+    "966": ("🇸🇦", "Saudi Arabia"),
+    "971": ("🇦🇪", "UAE"),
+    "974": ("🇶🇦", "Qatar"),
+    "965": ("🇰🇼", "Kuwait"),
+    "968": ("🇴🇲", "Oman"),
+    "973": ("🇧🇭", "Bahrain"),
+    "962": ("🇯🇴", "Jordan"),
+    "964": ("🇮🇶", "Iraq"),
+    "98":  ("🇮🇷", "Iran"),
+    "93":  ("🇦🇫", "Afghanistan"),
+    "212": ("🇲🇦", "Morocco"),
+    "213": ("🇩🇿", "Algeria"),
+    "216": ("🇹🇳", "Tunisia"),
+    "234": ("🇳🇬", "Nigeria"),
+    "254": ("🇰🇪", "Kenya"),
+    "255": ("🇹🇿", "Tanzania"),
+    "256": ("🇺🇬", "Uganda"),
+    "263": ("🇿🇼", "Zimbabwe"),
+    "381": ("🇷🇸", "Serbia"),
+    "380": ("🇺🇦", "Ukraine"),
+    "370": ("🇱🇹", "Lithuania"),
+    "371": ("🇱🇻", "Latvia"),
+    "372": ("🇪🇪", "Estonia"),
+    "48":  ("🇵🇱", "Poland"),
+    "40":  ("🇷🇴", "Romania"),
+    "36":  ("🇭🇺", "Hungary"),
+    "30":  ("🇬🇷", "Greece"),
+    "351": ("🇵🇹", "Portugal"),
+    "353": ("🇮🇪", "Ireland"),
+    "45":  ("🇩🇰", "Denmark"),
+    "46":  ("🇸🇪", "Sweden"),
+    "47":  ("🇳🇴", "Norway"),
+    "358": ("🇫🇮", "Finland"),
+    "41":  ("🇨🇭", "Switzerland"),
+    "43":  ("🇦🇹", "Austria"),
+    "32":  ("🇧🇪", "Belgium"),
+    "61":  ("🇦🇺", "Australia"),
+    "64":  ("🇳🇿", "New Zealand"),
+}
+
+def detect_country(number):
+    num = str(number).lstrip('+').lstrip('0')
+    for length in (3, 2, 1):
+        prefix = num[:length]
+        if prefix in COUNTRY_MAP:
+            return COUNTRY_MAP[prefix]
+    return ("🌍", "Unknown")
+
+def extract_otp(message):
+    if not message:
+        return None
+    match = re.search(r'\b(\d{4,8})\b', message)
+    return match.group(1) if match else None
+
 # ==================== স্টেট ====================
 def load_state():
     if STATE_FILE.exists():
@@ -42,7 +127,7 @@ def load_state():
     return {"last_dt": "", "seen_ids": []}
 
 def save_state(state):
-    state["seen_ids"] = state["seen_ids"][-2000:]   # মেমরি বাঁচাতে
+    state["seen_ids"] = state["seen_ids"][-2000:]
     tmp = str(STATE_FILE) + ".tmp"
     with open(tmp, "w") as f:
         json.dump(state, f)
@@ -58,7 +143,7 @@ def fetch(dt1=None):
     global rate_limited_until
     now = time.time()
     if now < rate_limited_until:
-        log.info(f"Rate-limited — আরও {int(rate_limited_until-now)}s")
+        log.info(f"Rate-limited — আরও {int(rate_limited_until - now)}s")
         return None
 
     params = {"token": API_TOKEN, "records": RECORDS}
@@ -84,16 +169,31 @@ def fetch(dt1=None):
             return None
         raise
 
-# ==================== মেসেজ ====================
+# ==================== মেসেজ ফরম্যাট ====================
 def fmt(row):
-    return (
-        f"📩 <b>New SMS</b>\n"
-        f"🕒 <code>{row.get('dt')}</code>\n"
-        f"📱 <code>{row.get('num')}</code>\n"
-        f"🏷 {row.get('cli')}\n"
-        f"💰 {row.get('payout')}\n"
-        f"💬 {row.get('message')}"
-    )
+    cli  = row.get('cli', 'Unknown')
+    num  = str(row.get('num', ''))
+    dt   = row.get('dt', '')
+    msg  = row.get('message', '').strip()
+
+    flag, country = detect_country(num)
+    otp = extract_otp(msg)
+
+    lines = [
+        f"✨ <b>OTP Received</b> ✨",
+        "",
+        f"⏰ <b>Time:</b> {dt}",
+        f"📞 <b>Number:</b> <code>{num}</code>",
+        f"🌍 <b>Country:</b> {flag} {country}",
+        f"🔧 <b>Service:</b> {cli}",
+    ]
+
+    if otp:
+        lines.append(f"🔐 <b>OTP Code:</b> <code>{otp}</code>")
+
+    lines.append(f"📝 <b>Msg:</b> {msg}")
+
+    return "\n".join(lines)
 
 def send_to_group(text):
     try:
@@ -103,7 +203,7 @@ def send_to_group(text):
         log.error(f"TG send fail: {e}")
         return False
 
-# ==================== ভেরিফিকেশন ====================
+# ==================== গ্রুপ ভেরিফিকেশন ====================
 def verify_group():
     try:
         bot.send_message(
@@ -115,7 +215,7 @@ def verify_group():
         log.info("✅ Startup message sent")
         return True
     except Exception as e:
-        log.error(f"❌ {e}")
+        log.error(f"❌ গ্রুপে পাঠানো যাচ্ছে না: {e}")
         return False
 
 # ==================== মেইন ====================
@@ -150,17 +250,16 @@ def main():
                     save_state(state)
                     last_dt = state["last_dt"]
                     first_run = False
-                    log.info(f"First run: {len(new_rows)} SMS স্কিপ, last_dt={last_dt}")
+                    log.info(f"First run: {len(new_rows)} SMS স্কিপ | last_dt={last_dt}")
 
                 elif new_rows:
                     new_rows.sort(key=lambda x: x.get("dt", ""))
-
                     sent = 0
                     for row in new_rows:
                         if send_to_group(fmt(row)):
                             sent += 1
                             last_dt = max(last_dt, row.get("dt", ""))
-                        time.sleep(0.35)   # Telegram flood এড়াতে
+                        time.sleep(0.35)
 
                     state["seen_ids"] = list(seen)
                     state["last_dt"] = last_dt
