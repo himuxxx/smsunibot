@@ -9,7 +9,7 @@ from pathlib import Path
 # ==================== কনফিগ ====================
 BOT_TOKEN     = os.environ["BOT_TOKEN"]
 API_TOKEN     = os.environ["UNIXSMS_TOKEN"]
-CHAT_ID       = int(os.environ["CHAT_ID"])
+CHAT_ID       = int(os.environ["CHAT_ID"])   # গ্রুপ ID (নেগেটিভ, যেমন -1001234567890)
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "2"))
 RECORDS       = int(os.getenv("RECORDS_PER_FETCH", "50"))
 API_URL       = "https://agent-api.unixsms.com/v2/cdr"
@@ -79,20 +79,27 @@ def fmt(row):
         f"💬 {row.get('message')}"
     )
 
+# ==================== গ্রুপে পাঠানো ====================
+def send_to_group(text):
+    try:
+        bot.send_message(CHAT_ID, text)
+        return True
+    except Exception as e:
+        log.error(f"Send to group {CHAT_ID} failed: {e}")
+        return False
+
 # ==================== মেইন লুপ ====================
 def main():
     seen = load_seen()
     first_run = len(seen) == 0
-    log.info(f"Bot চালু হলো | poll={POLL_INTERVAL}s | first_run={first_run}")
+    log.info(f"Bot চালু হলো | group={CHAT_ID} | poll={POLL_INTERVAL}s | first_run={first_run}")
 
-    try:
-        bot.send_message(
-            CHAT_ID,
-            f"✅ Unix SMS Forwarder চালু হয়েছে\n"
-            f"⏱ Poll: {POLL_INTERVAL}s | 📥 Fetch: {RECORDS}",
-        )
-    except Exception as e:
-        log.warning(f"Startup message failed: {e}")
+    # গ্রুপে startup message
+    send_to_group(
+        f"✅ Unix SMS Forwarder চালু হয়েছে\n"
+        f"⏱ Poll: {POLL_INTERVAL}s | 📥 Fetch: {RECORDS}\n"
+        f"📢 Group ID: <code>{CHAT_ID}</code>"
+    )
 
     fail_count = 0
 
@@ -117,14 +124,11 @@ def main():
                     new_rows.sort(key=lambda x: x.get("dt", ""))
                     sent = 0
                     for row in new_rows:
-                        try:
-                            bot.send_message(CHAT_ID, fmt(row))
+                        if send_to_group(fmt(row)):
                             sent += 1
-                            time.sleep(0.3)
-                        except Exception as e:
-                            log.error(f"TG send fail: {e}")
+                        time.sleep(0.3)
                     save_seen(seen)
-                    log.info(f"{sent} টি নতুন SMS পাঠানো হলো")
+                    log.info(f"{sent} টি নতুন SMS গ্রুপে পাঠানো হলো")
 
                 fail_count = 0
 
