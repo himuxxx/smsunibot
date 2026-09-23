@@ -1,5 +1,6 @@
 import os
 import re
+import html
 import time
 import json
 import logging
@@ -14,13 +15,13 @@ CHAT_ID       = int(os.environ["CHAT_ID"])
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "20"))
 RECORDS       = int(os.getenv("RECORDS_PER_FETCH", "200"))
 API_URL       = "https://agent-api.unixsms.com/v2/cdr"
+HTTP_TIMEOUT  = int(os.getenv("HTTP_TIMEOUT", "40"))   # 20 → 40 সেকেন্ড
 
 DATA_DIR   = Path(os.getenv("DATA_DIR", "."))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 STATE_FILE = DATA_DIR / "state.json"
 LOG_FILE   = DATA_DIR / "bot.log"
 
-# ==================== লগিং ====================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -116,6 +117,10 @@ def extract_otp(message):
     match = re.search(r'\b(\d{4,8})\b', message)
     return match.group(1) if match else None
 
+def esc(text):
+    """HTML special chars escape — Telegram parse error এড়াতে"""
+    return html.escape(str(text), quote=False)
+
 # ==================== স্টেট ====================
 def load_state():
     if STATE_FILE.exists():
@@ -151,7 +156,7 @@ def fetch(dt1=None):
         params["dt1"] = dt1
 
     try:
-        r = requests.get(API_URL, params=params, timeout=20)
+        r = requests.get(API_URL, params=params, timeout=HTTP_TIMEOUT)
 
         if r.status_code == 429:
             retry = max(int(r.headers.get("Retry-After", 60)), 60)
@@ -159,8 +164,20 @@ def fetch(dt1=None):
             log.warning(f"429 — {retry}s থামছি")
             return None
 
+        if r.status_code >= 500:
+            log.warning(f"API {r.status_code} — server error, পরে আবার চেষ্টা করব")
+            return None
+
         r.raise_for_status()
         return r.json()
+
+    except requests.exceptions.Timeout:
+        log.warning(f"API timeout ({HTTP_TIMEOUT}s) — server slow, পরে চেষ্টা")
+        return None
+
+    except requests.exceptions.ConnectionError as e:
+        log.warning(f"Connection error: {e}")
+        return None
 
     except requests.exceptions.HTTPError as e:
         if e.response is not None and e.response.status_code == 429:
@@ -169,15 +186,15 @@ def fetch(dt1=None):
             return None
         raise
 
-# ==================== মেসেজ ফরম্যাট ====================
+# ==================== মেসেজ ====================
 def fmt(row):
-    cli  = row.get('cli', 'Unknown')
-    num  = str(row.get('num', ''))
-    dt   = row.get('dt', '')
-    msg  = row.get('message', '').strip()
+    cli  = esc(row.get('cli', 'Unknown'))
+    num  = esc(str(row.get('num', '')))
+    dt   = esc(row.get('dt', ''))
+    msg  = esc(row.get('message', '').strip())
 
-    flag, country = detect_country(num)
-    otp = extract_otp(msg)
+    flag, country = detect_country(row.get('num', ''))
+    otp = extract_otp(row.get('message', ''))
 
     lines = [
         f"✨ <b>OTP Received</b> ✨",
@@ -201,9 +218,17 @@ def send_to_group(text):
         return True
     except Exception as e:
         log.error(f"TG send fail: {e}")
-        return False
+        # শেষ চেষ্টা: HTML ছাড়া plain text
+        try:
+            plain = re.sub(r'<[^>]+>', '', text)
+            bot.send_message(CHAT_ID, plain, parse_mode=None)
+            log.info("Plain text fallback-এ পাঠানো হলো")
+            return True
+        except Exception as e2:
+            log.error(f"Fallback-ও fail: {e2}")
+            return False
 
-# ==================== গ্রুপ ভেরিফিকেশন ====================
+# ==================== ভেরিফিকেশন ====================
 def verify_group():
     try:
         bot.send_message(
@@ -258,7 +283,9 @@ def main():
                     for row in new_rows:
                         if send_to_group(fmt(row)):
                             sent += 1
-                            last_dt = max(last_dt, row.get("dt", ""))
+                        # সফল হোক বা fail হোক, last_dt advance করি
+                        # নাহলে একটা fail হওয়া SMS বাকি সব আটকে রাখবে
+                        last_dt = max(last_dt, row.get("dt", ""))
                         time.sleep(0.35)
 
                     state["seen_ids"] = list(seen)
